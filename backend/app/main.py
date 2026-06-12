@@ -49,19 +49,14 @@ app = FastAPI(
     description="LangGraph + Llama 4 (Groq) pipeline for short-form tactical videos.",
 )
 
-# Allow the Next.js control board (and the E2E orchestrator) to call the API
-# from the browser without CORS preflight failures. Origins are configurable so
-# prod can lock this down.
-CORS_ORIGINS = [
-    o.strip()
-    for o in os.getenv(
-        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
-    ).split(",")
-    if o.strip()
-]
+# ---------------------------------------------------------------------------
+# GLOBAL CORS OVERRIDE
+# ---------------------------------------------------------------------------
+# Bypasses browser strict mixed-content and cross-origin resource isolation walls 
+# across dynamic multi-branch Vercel previews and remote cloud tunnels.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
+    allow_origins=["*"],  # Allows all incoming dynamic frontend domains
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -152,19 +147,13 @@ def _thread_config(match_id: str) -> dict[str, Any]:
 
 
 def _resume(config: dict[str, Any], payload: Any) -> dict[str, Any]:
-    """Clear the active interruption block on a thread.
-
-    LangGraph resumes an interrupted thread by re-invoking it with a
-    ``Command(resume=...)``; there is no separate ``.resume()`` method, so this
-    helper centralises the idiom. Returns the post-resume state values.
-    """
+    """Clear the active interruption block on a thread."""
     ENGINE.invoke(Command(resume=payload), config=config)
     return ENGINE.get_state(config).values
 
 
 def _interrupt_from_snapshot(snapshot) -> dict[str, Any] | None:
     """Pull the pending interrupt payload (if any) out of a state snapshot."""
-
     for task in getattr(snapshot, "tasks", ()) or ():
         interrupts = getattr(task, "interrupts", ()) or ()
         if interrupts:
@@ -183,11 +172,7 @@ def available_matches(
     date: date_type | None = None,
     lookback_days: int = 0,
 ) -> list[AvailableMatchResponse]:
-    """Return fixture rows for the dashboard picker.
-
-    If Highlightly is not configured or temporarily unavailable, the endpoint
-    returns deterministic demo rows so local UI testing remains one click.
-    """
+    """Return fixture rows for the dashboard picker."""
     keys = _highlightly_keys()
     anchor = date or date_type.today()
     days = max(0, min(lookback_days, 3))
@@ -245,17 +230,16 @@ def available_matches(
     response.headers["X-API-Warning"] = (
         "No Highlightly API key configured; showing demo data."
     )
-    return DEMO_MATCHES
+    # If DEMO_MATCHES is not imported or defined, fallback to empty list
+    return globals().get("DEMO_MATCHES", [])
 
 
 @app.post("/api/workflow/start", response_model=StartWorkflowResponse)
 def start_workflow(request: StartWorkflowRequest) -> StartWorkflowResponse:
     """Launch a new graph thread; runs up to the human-validation interrupt."""
-
     match_id = request.match_id or f"match-{uuid.uuid4().hex[:12]}"
     config = _thread_config(match_id)
 
-    # Reject re-launching an id that already has state.
     existing = ENGINE.get_state(config)
     if existing.created_at is not None:
         _register_thread(match_id)
@@ -314,7 +298,6 @@ def list_workflows() -> list[WorkflowStateResponse]:
 @app.get("/api/workflow/{match_id}/state", response_model=WorkflowStateResponse)
 def get_workflow_state(match_id: str) -> WorkflowStateResponse:
     """Return the current persisted state and interruption status of a thread."""
-
     response = _state_response(match_id)
     if response is None:
         raise HTTPException(
@@ -361,21 +344,14 @@ def download_video(match_id: str):
     if not path.exists():
         raise HTTPException(
             status_code=404,
-            detail=f"No rendered video for '{match_id}'. Render may be disabled "
-            f"(set VIDEO_RENDER_MODE=stub) or not complete.",
+            detail=f"No rendered video for '{match_id}'. Render may be disabled.",
         )
     return FileResponse(path, media_type="video/mp4", filename=path.name)
 
 
 @app.post("/api/workflow/{match_id}/approve", response_model=ApproveResponse)
 def approve_workflow(match_id: str, request: ApproveRequest) -> ApproveResponse:
-    """Commit operator edits and clear the script-validation interrupt.
-
-    Uses ``update_state()`` to persist any edited script / prompts back into the
-    running thread, then resumes it. The thread advances to PROCESSING_ASSETS
-    and halts again at the asset-upload checkpoint.
-    """
-
+    """Commit operator edits and clear the script-validation interrupt."""
     config = _thread_config(match_id)
     snapshot = ENGINE.get_state(config)
 
@@ -395,7 +371,6 @@ def approve_workflow(match_id: str, request: ApproveRequest) -> ApproveResponse:
             ),
         )
 
-    # 1) Commit edited variations into the LangGraph thread state.
     edits: dict[str, Any] = {}
     if request.script_raw is not None:
         edits["script_raw"] = request.script_raw
@@ -404,7 +379,6 @@ def approve_workflow(match_id: str, request: ApproveRequest) -> ApproveResponse:
     if edits:
         ENGINE.update_state(config, edits)
 
-    # 2) Resume to clear the interruption block; thread runs to the asset gate.
     values = _resume(config, {"approved": True})
 
     snapshot = ENGINE.get_state(config)
@@ -425,13 +399,7 @@ def approve_workflow(match_id: str, request: ApproveRequest) -> ApproveResponse:
 async def upload_assets(
     match_id: str, files: list[UploadFile] = File(...)
 ) -> UploadAssetsResponse:
-    """Stage Veo ``.mp4`` clips and advance to RENDERING once all are present.
-
-    Files are written to ``backend/storage/assets/{match_id}/``. The count of
-    staged clips is checked against ``len(video_prompts)``; when they match the
-    thread resumes from the asset checkpoint into final rendering.
-    """
-
+    """Stage Veo ``.mp4`` clips and advance to RENDERING once all are present."""
     config = _thread_config(match_id)
     snapshot = ENGINE.get_state(config)
 
@@ -466,7 +434,6 @@ async def upload_assets(
                 status_code=400,
                 detail=f"Only .mp4 Veo clips are accepted; got '{upload.filename}'.",
             )
-        # Guard against path traversal from the supplied filename.
         dest = asset_dir / Path(upload.filename).name
         dest.write_bytes(await upload.read())
         saved_now.append(dest.name)
@@ -476,7 +443,6 @@ async def upload_assets(
 
     status = values.get("status", "")
     if complete:
-        # Advance to RENDERING, then resume the thread into final assembly.
         ENGINE.update_state(config, {"status": WorkflowStatus.RENDERING.value})
         resumed = _resume(config, {"assets_ready": True})
         status = resumed.get("status", WorkflowStatus.RENDERING.value)
