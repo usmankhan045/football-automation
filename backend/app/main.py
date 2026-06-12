@@ -7,7 +7,6 @@ interrupt) and one to poll a thread's persisted state.
 
 from __future__ import annotations
 
-import logging
 import os
 import time
 import uuid
@@ -16,7 +15,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from langgraph.checkpoint.memory import MemorySaver
@@ -396,21 +395,15 @@ def approve_workflow(match_id: str, request: ApproveRequest) -> ApproveResponse:
     )
 
 
-def _resume_in_background(config: dict[str, Any]) -> None:
-    """Fire the asset-ready resume in a background thread (avoids gateway timeouts)."""
-    try:
-        _resume(config, {"assets_ready": True})
-    except Exception as exc:
-        logging.getLogger("main").warning("Background render failed: %s", exc)
-
-
 @app.post("/api/workflow/{match_id}/upload-assets", response_model=UploadAssetsResponse)
 async def upload_assets(
-    match_id: str,
-    background_tasks: BackgroundTasks,
-    files: list[UploadFile] = File(...),
+    match_id: str, files: list[UploadFile] = File(...)
 ) -> UploadAssetsResponse:
-    """Stage Veo ``.mp4`` clips and advance to RENDERING once all are present."""
+    """Stage Veo ``.mp4`` clips and advance to RENDERING once all are present.
+
+    Uses safe chunked streaming to prevent the Linux OOM Killer from killing
+    the process on low-RAM droplets.
+    """
     config = _thread_config(match_id)
     snapshot = ENGINE.get_state(config)
 
@@ -445,8 +438,13 @@ async def upload_assets(
                 status_code=400,
                 detail=f"Only .mp4 Veo clips are accepted; got '{upload.filename}'.",
             )
+
         dest = asset_dir / Path(upload.filename).name
-        dest.write_bytes(await upload.read())
+
+        with open(dest, "wb") as buffer:
+            while chunk := await upload.read(1024 * 1024):  # 1 MB chunks
+                buffer.write(chunk)
+
         saved_now.append(dest.name)
 
     uploaded = len(list(asset_dir.glob("*.mp4")))
@@ -455,8 +453,8 @@ async def upload_assets(
     status = values.get("status", "")
     if complete:
         ENGINE.update_state(config, {"status": WorkflowStatus.RENDERING.value})
-        status = WorkflowStatus.RENDERING.value
-        background_tasks.add_task(_resume_in_background, config)
+        resumed = _resume(config, {"assets_ready": True})
+        status = resumed.get("status", WorkflowStatus.RENDERING.value)
 
     return UploadAssetsResponse(
         match_id=match_id,
