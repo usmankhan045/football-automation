@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #06080b;
+  --bg-2: #080b0f;
+  --panel: #0a0e13;
+  --panel-2: #0d1219;
+  --line: rgba(126, 162, 178, 0.1);
+  --line-2: rgba(126, 162, 178, 0.22);
+  --text: #c6d1d9;
+  --text-dim: #7e8a95;
+  --text-mute: #4f5963;
+  --accent: #00f0c8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  position: relative;
+  color: var(--text);
+  font-family: var(--font-display), system-ui, sans-serif;
+  background:
+    radial-gradient(1100px 560px at 82% -12%, rgba(0, 240, 200, 0.06), transparent 60%),
+    radial-gradient(880px 520px at -8% 112%, rgba(176, 108, 255, 0.055), transparent 55%),
+    var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+
+/* Blueprint grid wash — faint, masked toward the top for depth. */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 46px 46px;
+  -webkit-mask-image: radial-gradient(ellipse 90% 80% at 50% 0%, #000 30%, transparent 85%);
+  mask-image: radial-gradient(ellipse 90% 80% at 50% 0%, #000 30%, transparent 85%);
+  opacity: 0.55;
+}
+
+/* Fine grain overlay for texture. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+::selection {
+  background: rgba(0, 240, 200, 0.28);
+  color: #eafffa;
+}
+
+/* Scoped, minimal scrollbar to match the HUD aesthetic. */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+  border-radius: 0;
+}
+.scroll-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@layer components {
+  /* Sharp, bordered data panel — the core building block. */
+  .panel {
+    position: relative;
+    background: linear-gradient(180deg, var(--panel-2), var(--panel));
+    border: 1px solid var(--line);
+  }
+
+  /* Decorative corner ticks for the HUD feel. */
+  .corner::before,
+  .corner::after {
+    content: "";
+    position: absolute;
+    width: 9px;
+    height: 9px;
+    border: 1px solid var(--line-2);
+    pointer-events: none;
+  }
+  .corner::before {
+    top: -1px;
+    left: -1px;
+    border-right: 0;
+    border-bottom: 0;
+  }
+  .corner::after {
+    bottom: -1px;
+    right: -1px;
+    border-left: 0;
+    border-top: 0;
+  }
+
+  /* Uppercase mono micro-label used for every field/section tag. */
+  .label {
+    font-family: var(--font-mono), monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    font-size: 10px;
+    line-height: 1;
+    color: var(--text-mute);
+  }
+
+  .hairline {
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--line-2), transparent);
+  }
+
+  /* Primary HUD button. */
+  .btn {
+    font-family: var(--font-mono), monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    font-size: 12px;
+    border: 1px solid var(--line-2);
+    color: var(--text);
+    background: rgba(255, 255, 255, 0.012);
+    transition:
+      border-color 0.18s ease,
+      color 0.18s ease,
+      background 0.18s ease,
+      box-shadow 0.18s ease;
+  }
+  .btn:hover:not(:disabled) {
+    border-color: rgba(0, 240, 200, 0.55);
+    color: #eafffa;
+    box-shadow: 0 0 0 1px rgba(0, 240, 200, 0.12), 0 0 22px rgba(0, 240, 200, 0.12);
+  }
+  .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+}

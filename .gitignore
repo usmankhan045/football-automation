@@ -1,0 +1,37 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# Generated storage (large binary outputs)
+backend/storage/outputs/
+backend/storage/assets/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+.next/
+frontend/.next/
+tsconfig.tsbuildinfo
+frontend/tsconfig.tsbuildinfo
+
+# Claude Code internals
+.claude/
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
