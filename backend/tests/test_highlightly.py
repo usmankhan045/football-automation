@@ -106,6 +106,35 @@ def test_fetch_unwraps_data_envelope(monkeypatch):
     assert stats["home_team"] == "Germany"
 
 
+def test_fetch_available_matches_from_data_envelope(monkeypatch):
+    monkeypatch.setattr(highlightly, "_client", _mock_client({"data": [MATCH]}))
+    rows = highlightly.fetch_available_matches("KEY", date="2026-06-12")
+    assert rows == [
+        {
+            "id": "99001",
+            "home_team": "Germany",
+            "away_team": "Japan",
+            "competition": "World Cup",
+            "season": 2026,
+            "stage": "Group Stage",
+            "kickoff": None,
+            "status": "Finished",
+            "final_score": "1-2",
+            "data_source": "highlightly",
+        }
+    ]
+
+
+def test_fetch_available_matches_excludes_not_started(monkeypatch):
+    upcoming = {
+        **MATCH,
+        "id": 99002,
+        "state": {"description": "Not started"},
+    }
+    monkeypatch.setattr(highlightly, "_client", _mock_client({"data": [upcoming]}))
+    assert highlightly.fetch_available_matches("KEY", date="2026-06-12") == []
+
+
 def test_fetch_requires_key():
     with pytest.raises(HighlightlyError, match="not set"):
         highlightly.fetch_match_data(1, "")

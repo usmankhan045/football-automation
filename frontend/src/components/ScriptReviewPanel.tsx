@@ -36,6 +36,7 @@ export function ScriptReviewPanel({ thread, busy = false, onApprove }: Props) {
     [script],
   );
   const inRange = wordCount >= WORD_MIN && wordCount <= WORD_MAX;
+  const canApprove = script.trim().length > 0 && prompts.some((p) => p.trim().length > 0);
 
   async function copyPrompt(text: string, index: number) {
     try {
@@ -76,7 +77,7 @@ export function ScriptReviewPanel({ thread, busy = false, onApprove }: Props) {
               className="font-mono text-[11px] tracking-[0.1em]"
               style={{ color: inRange ? "#2fe6a0" : "#ff7a3c" }}
             >
-              {wordCount} / {WORD_MIN}-{WORD_MAX} W
+              {wordCount} / {WORD_MIN}-{WORD_MAX} W{inRange ? "" : " · WARN"}
             </span>
           </div>
           <textarea
@@ -87,8 +88,8 @@ export function ScriptReviewPanel({ thread, busy = false, onApprove }: Props) {
             placeholder="Awaiting generated script…"
           />
           <p className="mt-2.5 font-mono text-[10px] leading-relaxed text-mute">
-            Edit inline before confirmation. Word count is enforced to keep the
-            Short between 25–40 seconds.
+            Edit inline before confirmation. The word target keeps the Short
+            between 25-40 seconds, but you can approve a shorter cut.
           </p>
         </div>
 
@@ -155,13 +156,18 @@ export function ScriptReviewPanel({ thread, busy = false, onApprove }: Props) {
         </span>
         <button
           type="button"
-          disabled={busy || !inRange}
+          disabled={busy || !canApprove}
           onClick={() => onApprove({ script_raw: script, visual_prompts: prompts })}
           className="btn relative overflow-hidden px-6 py-3"
           style={
-            inRange && !busy
+            canApprove && !busy
               ? { borderColor: "rgba(0,240,200,0.55)", color: "#eafffa" }
               : undefined
+          }
+          title={
+            inRange
+              ? "Approve and resume the pipeline"
+              : "Script is outside the target word count, but approval is allowed"
           }
         >
           {busy ? "Resuming…" : "Approve & Resume Pipeline →"}

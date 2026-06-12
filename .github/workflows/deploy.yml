@@ -1,0 +1,37 @@
+name: Deploy to DigitalOcean Droplet
+
+on:
+  push:
+    branches:
+      - main  # Triggers the workflow every time you push to the main branch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Execute Remote SSH Commands (Sync & Restart)
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DROPLET_IP }}
+          username: ${{ secrets.DROPLET_USER }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
+          port: 22
+          script: |
+            # Navigate to the project directory
+            cd /root/football-automation
+            
+            # Pull the latest changes from GitHub
+            git fetch --all
+            git reset --hard origin/main
+            
+            # Active the environment and update any new python dependencies
+            cd backend
+            source venv/bin/activate
+            pip install -r requirements.txt
+            
+            # Restart the background service to apply code changes instantly
+            sudo systemctl restart football-automation

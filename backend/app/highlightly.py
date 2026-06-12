@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from urllib.parse import urlencode
 from typing import Any, Optional
 
 import httpx
@@ -30,6 +31,27 @@ BASE_URL = "https://sports.highlightly.net/football"
 
 class HighlightlyError(RuntimeError):
     """Raised on any API failure or when the match cannot be parsed."""
+
+
+def is_quota_error(exc: BaseException) -> bool:
+    """Best-effort detection for exhausted/burned provider credentials."""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "http 401",
+            "http 403",
+            "http 429",
+            "quota",
+            "limit",
+            "too many requests",
+            "rate limit",
+            "exceeded",
+            "subscription",
+            "unauthorized",
+            "forbidden",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +284,161 @@ def _get(client: httpx.Client, url: str) -> Any:
         return resp.json()
     except ValueError as exc:
         raise HighlightlyError(f"non-JSON response for {url}") from exc
+
+
+def _unwrap_matches(payload: Any) -> list[dict[str, Any]]:
+    """Return the first list of match objects from common API envelopes."""
+    if isinstance(payload, list):
+        return [m for m in payload if isinstance(m, dict)]
+    if isinstance(payload, dict):
+        for key in ("data", "matches", "fixtures", "events", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [m for m in value if isinstance(m, dict)]
+            if isinstance(value, dict):
+                nested = _unwrap_matches(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _match_time(match: dict[str, Any]) -> str | None:
+    for key in ("date", "kickoff", "kickoffTime", "startTime", "timestamp", "utcDate"):
+        value = match.get(key)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _available_match(match: dict[str, Any]) -> dict[str, Any] | None:
+    match_id = match.get("id") or match.get("matchId") or match.get("eventId")
+    if match_id is None:
+        return None
+
+    home = _team_name(match, "homeTeam") or _team_name(match, "home") or "Home"
+    away = _team_name(match, "awayTeam") or _team_name(match, "away") or "Away"
+    hg, ag = _parse_score(match)
+    league = match.get("league") or match.get("competition") or {}
+    state = match.get("state") or {}
+    status = (
+        state.get("description")
+        if isinstance(state, dict)
+        else None
+    ) or match.get("status")
+
+    return {
+        "id": str(match_id),
+        "home_team": home,
+        "away_team": away,
+        "competition": league.get("name") if isinstance(league, dict) else None,
+        "season": _to_int(
+            (league.get("season") if isinstance(league, dict) else None)
+            or match.get("season")
+        ),
+        "stage": match.get("round") or (
+            league.get("round") if isinstance(league, dict) else None
+        ),
+        "kickoff": _match_time(match),
+        "status": str(status) if status is not None else None,
+        "final_score": f"{hg}-{ag}" if hg is not None and ag is not None else None,
+        "data_source": "highlightly",
+    }
+
+
+def _is_world_cup_2026(row: dict[str, Any]) -> bool:
+    competition = str(row.get("competition") or "").lower()
+    if "world cup" not in competition:
+        return False
+    if any(marker in competition for marker in ("qualification", "qualifier", "women")):
+        return False
+
+    if row.get("season") == 2026:
+        return True
+    if row.get("season") is not None:
+        return False
+
+    kickoff = str(row.get("kickoff") or "")
+    return kickoff.startswith("2026")
+
+
+def _is_completed_match(row: dict[str, Any]) -> bool:
+    status = str(row.get("status") or "").lower()
+    final_score = str(row.get("final_score") or "").strip()
+
+    if any(
+        marker in status
+        for marker in (
+            "not started",
+            "scheduled",
+            "postponed",
+            "cancelled",
+            "canceled",
+            "delayed",
+            "upcoming",
+        )
+    ):
+        return False
+
+    if final_score and final_score != "TBD":
+        return True
+
+    return any(
+        marker in status
+        for marker in (
+            "finished",
+            "full time",
+            "ft",
+            "ended",
+            "complete",
+            "closed",
+            "after extra",
+            "aet",
+            "pen",
+        )
+    )
+
+
+def fetch_available_matches(
+    api_key: str,
+    *,
+    date: str | None = None,
+    timeout: float = 15.0,
+) -> list[dict[str, Any]]:
+    """Fetch match rows for the dashboard picker.
+
+    Highlightly deployments vary slightly in their query parameter naming, so
+    the endpoint can be tuned with ``HIGHLIGHTLY_MATCHES_QUERY_PARAM``. The
+    default uses the common ``date=YYYY-MM-DD`` shape.
+    """
+    if not api_key:
+        raise HighlightlyError("HIGHLIGHTLY_API_KEY is not set.")
+
+    base = os.getenv("HIGHLIGHTLY_HOST", BASE_URL)
+    headers = {
+        "x-rapidapi-key": api_key,
+        "x-rapidapi-host": os.getenv(
+            "HIGHLIGHTLY_API_HOST", "sport-highlights-api.p.rapidapi.com"
+        ),
+        "Accept": "application/json",
+    }
+    params: dict[str, str] = {}
+    if date:
+        params[os.getenv("HIGHLIGHTLY_MATCHES_QUERY_PARAM", "date")] = date
+    url = f"{base}/matches"
+    if params:
+        url = f"{url}?{urlencode(params)}"
+
+    with _client(headers, timeout) as client:
+        payload = _get(client, url)
+
+    matches = [
+        row for match in _unwrap_matches(payload) if (row := _available_match(match))
+    ]
+    matches = [
+        row for row in matches if _is_world_cup_2026(row) and _is_completed_match(row)
+    ]
+    matches.sort(key=lambda m: (m.get("kickoff") or "", m.get("competition") or ""))
+    return matches
 
 
 def fetch_match_data(

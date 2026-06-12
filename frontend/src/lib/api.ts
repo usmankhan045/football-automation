@@ -3,6 +3,7 @@
 
 import type {
   ApproveResponse,
+  AvailableMatch,
   MatchThread,
   UploadAssetsResponse,
   WorkflowStatus,
@@ -42,9 +43,29 @@ export async function fetchState(matchId: string): Promise<MatchThread> {
   return asJson<MatchThread>(res);
 }
 
+export async function resumeWorkflow(matchId: string): Promise<MatchThread> {
+  const res = await fetch(`${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/resume`, {
+    method: "POST",
+  });
+  return asJson<MatchThread>(res);
+}
+
 export async function listWorkflows(): Promise<MatchThread[]> {
   const res = await fetch(`${API_BASE}/api/workflow`, { cache: "no-store" });
   return asJson<MatchThread[]>(res);
+}
+
+export async function listAvailableMatches(
+  date?: string,
+  lookbackDays = 0,
+): Promise<{ matches: AvailableMatch[]; warning?: string }> {
+  const params = new URLSearchParams();
+  if (date) params.set("date", date);
+  params.set("lookback_days", String(lookbackDays));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  const res = await fetch(`${API_BASE}/api/matches${query}`, { cache: "no-store" });
+  const matches = await asJson<AvailableMatch[]>(res);
+  return { matches, warning: res.headers.get("X-API-Warning") ?? undefined };
 }
 
 export function downloadUrl(matchId: string): string {
@@ -69,15 +90,39 @@ export async function approveWorkflow(
 export async function uploadAssets(
   matchId: string,
   files: File[],
+  onProgress?: (percent: number) => void,
 ): Promise<UploadAssetsResponse> {
   const form = new FormData();
   for (const file of files) form.append("files", file, file.name);
 
-  const res = await fetch(
-    `${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/upload-assets`,
-    { method: "POST", body: form },
-  );
-  return asJson<UploadAssetsResponse>(res);
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(
+      "POST",
+      `${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/upload-assets`,
+    );
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      onProgress?.(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onload = () => {
+      try {
+        const body = JSON.parse(xhr.responseText || "{}") as UploadAssetsResponse & {
+          detail?: string;
+        };
+        if (xhr.status < 200 || xhr.status >= 300) {
+          reject(new Error(`${xhr.status} · ${body.detail ?? xhr.statusText}`));
+          return;
+        }
+        onProgress?.(100);
+        resolve(body);
+      } catch {
+        reject(new Error(`${xhr.status} · Invalid upload response`));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Upload failed. Check backend connection."));
+    xhr.send(form);
+  });
 }
 
 /** Narrowing guard used when reconciling API payloads into UI state. */

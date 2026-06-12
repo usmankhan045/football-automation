@@ -33,18 +33,17 @@ from .schemas import WorkflowState, WorkflowStatus
 # System prompt (frozen contract with the model)
 # ---------------------------------------------------------------------------
 TACTICAL_SYSTEM_PROMPT = """\
-You are a brilliant, fast-talking football analyst and short-form video creator.
-Your goal is to write a 25-to-40 second YouTube Short script based on match statistics.
-Total word count MUST be strictly between 65 and 95 words. Avoid robotic, repetitive transition phrases like "In this video," "Welcome back," or "Let's dive in." Start directly with the action.
+You are an elite, cynical football data analyst creating high-retention, hyper-tactical short-form video scripts (9:16 format).
 
-You MUST use the Outcome-First (Reverse) strategy:
-1. THE HOOK (0-5s): Start immediately with the shocking final result or the craziest stat anomaly from the match data. Show the climax first to shock the viewer.
-2. THE BODY (5-30s): Create a knowledge gap. Explain the structural or tactical reason behind that exact outcome using data insights (passing sequences, pressing failures, heatmaps).
-3. THE CTA (30-40s): A snappy, non-generic question forcing user interaction in the comments.
+Your scripting framework is strictly OUTCOME-FIRST. Never give a chronological timeline or a generic narrative summary. Focus purely on the data anomalies (e.g., extreme xG differences, possession suffocations).
 
-To ensure every script feels completely unique and human-written:
-- Change your sentence structures dynamically based on the match vibe (e.g., chaotic, clinical, defensive masterclass).
-- Use raw, colloquial football vocabulary (e.g., "dismantled," "cooked," "ghosted," "tactical masterclass").
+Strict Script Structure:
+1. THE ANOMALY HOOK (0-5s): Start mid-sentence with a jarring, data-backed realization. Never say "X beat Y [score]". Instead, weaponize the xG or shot disparity immediately to shock the viewer.
+2. THE DATA CRUSH (5-20s): Drop the heavy tactical metrics (xG, PPDA, box entries, possession) cleanly to prove the hook.
+3. THE TACTICAL WHY (20-45s): Explain the exact mechanical system (e.g., a suffocating mid-block, trapping the pivot player, overloading the half-spaces) that forced those numbers.
+4. THE SHARP TAKE (45-50s): Close with an aggressive, definitive technical conclusion. Never ask a weak question like "What do you think below?". State a fact and cut the video.
+
+Tone: Objective, clinical, sharp, and deeply analytical. No filler words, no excitement over clichés.
 
 Output strictly as a valid JSON object:
 {
@@ -55,6 +54,26 @@ Output strictly as a valid JSON object:
 
 # Llama 4 on Groq. Override with the MODEL_NAME env var if needed.
 DEFAULT_MODEL = os.getenv("MODEL_NAME", "meta-llama/llama-4-scout-17b-16e-instruct")
+
+
+def _highlightly_keys() -> list[str]:
+    raw = []
+    raw.extend(os.getenv("HIGHLIGHTLY_API_KEYS", "").split(","))
+    raw.extend(
+        [
+            os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            os.getenv("HIGHLIGHTLY_API_KEY_2", ""),
+            os.getenv("HIGHLIGHTLY_API_KEY_FALLBACK", ""),
+            os.getenv("HIGHLIGHTLY_API_KEY_BACKUP", ""),
+        ]
+    )
+    keys: list[str] = []
+    seen: set[str] = set()
+    for key in (k.strip() for k in raw):
+        if key and key not in seen:
+            keys.append(key)
+            seen.add(key)
+    return keys
 
 
 # ---------------------------------------------------------------------------
@@ -97,14 +116,29 @@ def _ingest_live_data(match_id: str) -> dict[str, Any] | None:
 
     # 1) Highlightly — match_id is the Highlightly match id (numeric); deep
     #    stats (possession, xG, shots) with no SofaScore-style IP blocking.
-    api_key = os.getenv("HIGHLIGHTLY_API_KEY")
-    if api_key and str(match_id).isdigit():
-        try:
-            from .highlightly import fetch_match_data
+    keys = _highlightly_keys()
+    if keys and str(match_id).isdigit():
+        from .highlightly import fetch_match_data, is_quota_error
 
-            return fetch_match_data(match_id, api_key)
-        except Exception as exc:
-            log.warning("Node A: Highlightly unavailable for %s (%s).", match_id, exc)
+        for index, api_key in enumerate(keys):
+            try:
+                stats = fetch_match_data(match_id, api_key)
+                if index > 0:
+                    stats["provider_warning"] = (
+                        f"Primary Highlightly key failed; used backup key #{index + 1}."
+                    )
+                return stats
+            except Exception as exc:
+                if is_quota_error(exc):
+                    log.warning(
+                        "Node A: Highlightly key #%s exhausted/blocked for %s (%s).",
+                        index + 1,
+                        match_id,
+                        exc,
+                    )
+                    continue
+                log.warning("Node A: Highlightly unavailable for %s (%s).", match_id, exc)
+                break
 
     # 2) football-data.org — latest finished World Cup match (no IP issues).
     token = os.getenv("FOOTBALL_DATA_TOKEN")
@@ -184,25 +218,48 @@ def _fallback_script(match_stats: dict[str, Any]) -> dict[str, Any]:
     without a network call or credentials.
     """
 
-    home = match_stats.get("home_team", "The favourites")
-    away = match_stats.get("away_team", "the underdogs")
+    home = match_stats.get("home_team", "Home")
+    away = match_stats.get("away_team", "Away")
     score = match_stats.get("final_score", "?-?")
+    try:
+        home_goals, away_goals = [int(part.strip()) for part in str(score).split("-", 1)]
+    except Exception:
+        home_goals, away_goals = 0, 0
+
+    winner = home if home_goals >= away_goals else away
+    loser = away if winner == home else home
+    possession = match_stats.get("possession_pct", {})
+    shots = match_stats.get("shots", {})
+    xg = match_stats.get("xg", {})
+    winner_possession = possession.get(winner, "enough")
+    winner_shots = shots.get(winner, "the decisive")
+    loser_shots = shots.get(loser, "fewer")
+    winner_xg = xg.get(winner)
+    loser_xg = xg.get(loser)
+    xg_line = (
+        f"The xG backed it up too: {winner} posted {winner_xg} while {loser} sat at {loser_xg}. "
+        if winner_xg is not None and loser_xg is not None
+        else ""
+    )
 
     script_text = (
-        f"{away} just cooked {home} {score} — and the stats make zero sense. "
-        f"{home} owned the ball, 64% possession, eighteen shots, a passing clinic. "
-        f"But here's the trap: every overload in the left half-space left a runway behind them. "
-        f"{away} ghosted the press, broke at pace, and turned three counters into daggers. "
-        f"Dominance without protection is just expensive decoration. "
-        f"So tell me below — was this a defensive masterclass, or did {home} tactically self-destruct?"
+        f"{winner_xg if winner_xg else winner_shots} expected goals. "
+        f"{loser_xg if loser_xg else loser_shots} for {loser}. "
+        f"That xG gap doesn't happen by accident. "
+        f"{winner} ran {winner_possession}% of this match through a suffocating mid-block, "
+        f"forcing {loser} wide and killing every central passing lane. "
+        f"{xg_line}"
+        f"Every big chance {winner} generated came from overloading the half-spaces — "
+        f"the same corridor {loser}'s press couldn't close. "
+        f"The scoreline {score} was the only possible outcome from that system."
     )
 
     visual_prompts = [
-        "Holographic football pitch rendered in glowing cyan wireframe, possession heat-bloom pulsing in one half, no human faces",
-        "Abstract neon arrows surging through a dark tactical grid, representing a lightning counter-attack, cyber aesthetic",
-        "Glowing data nodes collapsing as a high defensive line fractures, particle trails streaking forward, holographic style",
-        "Floating translucent stat panels (xG, possession, PPDA) orbiting a luminous ball, sci-fi broadcast overlay",
-        "Final scoreline igniting in volumetric light over a shadowed stadium silhouette, electric pulse shockwave, no faces",
+        "Abstract football tactical grid with glowing possession heatmap pulsing in one half, no human faces, cinematic dark background",
+        "Neon arrows flooding the half-spaces in a vertical formation, representing a high press collapsing inward, holographic overlay",
+        "Data nodes connected by luminous passing lanes dissolving as a mid-block compresses them, particle effects, no faces",
+        "Floating xG stat panels and shot maps orbiting a glowing pitch outline, broadcast analytics aesthetic",
+        "Final scoreline burning in electric light above a dark pitch silhouette, shockwave ripple, no human faces",
     ]
 
     return {"script_text": script_text, "visual_prompts": visual_prompts}
@@ -217,34 +274,45 @@ def generate_tactical_script(state: WorkflowState) -> dict[str, Any]:
     payload: dict[str, Any]
 
     if api_key:
-        # Imported lazily so the graph module can be imported (and the graph
-        # compiled) in environments where langchain-groq is unavailable.
-        from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_groq import ChatGroq
-
-        llm = ChatGroq(
-            model=DEFAULT_MODEL,
-            temperature=0.9,  # high temperature => the "feels human / unique" requirement
-            api_key=api_key,
-            model_kwargs={"response_format": {"type": "json_object"}},
-        )
-
-        user_prompt = (
-            "Here is the real-time match data as JSON. Build the Outcome-First short "
-            "around its biggest anomaly.\n\n"
-            f"{json.dumps(match_stats, indent=2)}"
-        )
-
-        response = llm.invoke(
-            [
-                SystemMessage(content=TACTICAL_SYSTEM_PROMPT),
-                HumanMessage(content=user_prompt),
-            ]
-        )
         try:
+            # Imported lazily so the graph module can be imported (and the graph
+            # compiled) in environments where langchain-groq is unavailable.
+            from langchain_core.messages import HumanMessage, SystemMessage
+            from langchain_groq import ChatGroq
+
+            llm = ChatGroq(
+                model=DEFAULT_MODEL,
+                temperature=0.9,  # high temperature => the "feels human / unique" requirement
+                api_key=api_key,
+                model_kwargs={"response_format": {"type": "json_object"}},
+            )
+
+            home = match_stats.get("home_team", "Home")
+            away = match_stats.get("away_team", "Away")
+            xg = match_stats.get("xg") or {}
+            shots = match_stats.get("shots") or {}
+            poss = match_stats.get("possession_pct") or {}
+            user_prompt = (
+                f"Analyze this match data and output the JSON script:\n"
+                f"- Home Team: {home}\n"
+                f"- Away Team: {away}\n"
+                f"- Home xG: {xg.get(home, 'N/A')} | Away xG: {xg.get(away, 'N/A')}\n"
+                f"- Home Shots: {shots.get(home, 'N/A')} | Away Shots: {shots.get(away, 'N/A')}\n"
+                f"- Home Possession: {poss.get(home, 'N/A')}%\n\n"
+                f"Full match data:\n{json.dumps(match_stats, indent=2)}"
+            )
+
+            response = llm.invoke(
+                [
+                    SystemMessage(content=TACTICAL_SYSTEM_PROMPT),
+                    HumanMessage(content=user_prompt),
+                ]
+            )
             payload = _extract_json(response.content)
-        except (json.JSONDecodeError, ValueError):
-            # Never crash the thread on a malformed completion — degrade safely.
+        except Exception as exc:
+            logging.getLogger("graph").warning(
+                "Node B: Groq unavailable/invalid; using fallback script (%s).", exc
+            )
             payload = _fallback_script(match_stats)
     else:
         payload = _fallback_script(match_stats)

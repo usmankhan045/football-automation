@@ -362,8 +362,8 @@ def render_match_video(state: dict) -> dict:
 # Stub renderer — real 9:16 MoviePy export without Edge TTS / Whisper
 # ---------------------------------------------------------------------------
 STUB_WORDS_PER_SEC = 2.6
-STUB_MAX_SECONDS = 6.0
-STUB_MIN_SECONDS = 3.0
+STUB_MAX_SECONDS = 90.0
+STUB_MIN_SECONDS = 5.0
 
 
 def _generate_stub_audio(out_path: Path, duration: float, fps: int = 44100) -> Path:

@@ -20,6 +20,19 @@ export interface MatchStats {
   [key: string]: unknown;
 }
 
+export interface AvailableMatch {
+  id: string;
+  home_team: string;
+  away_team: string;
+  competition?: string | null;
+  season?: number | null;
+  stage?: string | null;
+  kickoff?: string | null;
+  status?: string | null;
+  final_score?: string | null;
+  data_source: string;
+}
+
 export interface MatchThread {
   match_id: string;
   status: WorkflowStatus;

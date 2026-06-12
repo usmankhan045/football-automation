@@ -56,6 +56,21 @@ class StartWorkflowRequest(BaseModel):
     )
 
 
+class AvailableMatchResponse(BaseModel):
+    """A lightweight fixture row for the dashboard match picker."""
+
+    id: str
+    home_team: str
+    away_team: str
+    competition: Optional[str] = None
+    season: Optional[int] = None
+    stage: Optional[str] = None
+    kickoff: Optional[str] = None
+    status: Optional[str] = None
+    final_score: Optional[str] = None
+    data_source: str = "highlightly"
+
+
 class StartWorkflowResponse(BaseModel):
     """Returned immediately after the graph halts at the approval interrupt."""
 

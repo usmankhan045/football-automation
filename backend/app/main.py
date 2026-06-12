@@ -8,11 +8,14 @@ interrupt) and one to poll a thread's persisted state.
 from __future__ import annotations
 
 import os
+import time
 import uuid
+from datetime import date as date_type
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from langgraph.checkpoint.memory import MemorySaver
@@ -29,6 +32,7 @@ from .graph import compile_graph
 from .schemas import (
     ApproveRequest,
     ApproveResponse,
+    AvailableMatchResponse,
     StartWorkflowRequest,
     StartWorkflowResponse,
     UploadAssetsResponse,
@@ -61,6 +65,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-API-Warning"],
 )
 
 # A single process-wide checkpointer keeps every thread's state addressable by
@@ -77,11 +82,68 @@ OUTPUT_ROOT = Path(__file__).resolve().parent.parent / "storage" / "outputs"
 # In-process registry of launched threads (MemorySaver can't enumerate ids).
 # Insertion-ordered so the dashboard lists newest activity predictably.
 THREAD_IDS: list[str] = []
+MATCH_CACHE_TTL_SECONDS = 1800
+MATCH_CACHE: dict[tuple[str, int, str], tuple[float, list[AvailableMatchResponse], str]] = {}
+
+
+def _highlightly_keys() -> list[str]:
+    """Return primary + backup Highlightly keys, preserving order."""
+    raw = []
+    raw.extend(os.getenv("HIGHLIGHTLY_API_KEYS", "").split(","))
+    raw.extend(
+        [
+            os.getenv("HIGHLIGHTLY_API_KEY", ""),
+            os.getenv("HIGHLIGHTLY_API_KEY_2", ""),
+            os.getenv("HIGHLIGHTLY_API_KEY_FALLBACK", ""),
+            os.getenv("HIGHLIGHTLY_API_KEY_BACKUP", ""),
+        ]
+    )
+    keys: list[str] = []
+    seen: set[str] = set()
+    for key in (k.strip() for k in raw):
+        if key and key not in seen:
+            keys.append(key)
+            seen.add(key)
+    return keys
+
+
+def _key_label(index: int) -> str:
+    return "primary key" if index == 0 else f"backup key #{index + 1}"
+
+
+def _cache_key(anchor: date_type, lookback_days: int, keys: list[str]) -> tuple[str, int, str]:
+    # Avoid storing secrets in the cache key; only key count/order signature.
+    return (anchor.isoformat(), lookback_days, f"{len(keys)}-keys")
 
 
 def _register_thread(match_id: str) -> None:
     if match_id not in THREAD_IDS:
         THREAD_IDS.append(match_id)
+
+
+def _known_match_ids() -> list[str]:
+    """Best-effort roster from registry, cached match rows, and storage."""
+    ids: list[str] = []
+
+    def add(value: Any) -> None:
+        mid = str(value or "").strip()
+        if mid and mid not in ids:
+            ids.append(mid)
+
+    for mid in THREAD_IDS:
+        add(mid)
+    for _, rows, _ in MATCH_CACHE.values():
+        for row in rows:
+            add(row.id)
+    for root in (STORAGE_ROOT, OUTPUT_ROOT):
+        if not root.exists():
+            continue
+        for path in root.iterdir():
+            if path.is_dir():
+                add(path.name)
+            elif path.name.endswith("_final.mp4"):
+                add(path.name.removesuffix("_final.mp4"))
+    return ids
 
 
 def _thread_config(match_id: str) -> dict[str, Any]:
@@ -115,6 +177,77 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "groq_configured": bool(GROQ_API_KEY)}
 
 
+@app.get("/api/matches", response_model=list[AvailableMatchResponse])
+def available_matches(
+    response: Response,
+    date: date_type | None = None,
+    lookback_days: int = 0,
+) -> list[AvailableMatchResponse]:
+    """Return fixture rows for the dashboard picker.
+
+    If Highlightly is not configured or temporarily unavailable, the endpoint
+    returns deterministic demo rows so local UI testing remains one click.
+    """
+    keys = _highlightly_keys()
+    anchor = date or date_type.today()
+    days = max(0, min(lookback_days, 3))
+    if keys:
+        cache_key = _cache_key(anchor, days, keys)
+        cached = MATCH_CACHE.get(cache_key)
+        if cached and time.time() - cached[0] < MATCH_CACHE_TTL_SECONDS:
+            warning = cached[2]
+            if warning:
+                response.headers["X-API-Warning"] = warning
+            return cached[1]
+
+        from .highlightly import fetch_available_matches, is_quota_error
+
+        warnings: list[str] = []
+        for key_index, api_key in enumerate(keys):
+            seen: set[str] = set()
+            out: list[AvailableMatchResponse] = []
+            quota_exhausted = False
+            for offset in range(days + 1):
+                try:
+                    rows = fetch_available_matches(
+                        api_key,
+                        date=(anchor - timedelta(days=offset)).isoformat(),
+                    )
+                except Exception as exc:
+                    if is_quota_error(exc):
+                        warnings.append(
+                            f"Highlightly {_key_label(key_index)} is exhausted or blocked."
+                        )
+                        quota_exhausted = True
+                        break
+                    continue
+                for row in rows:
+                    if row["id"] in seen:
+                        continue
+                    seen.add(row["id"])
+                    out.append(AvailableMatchResponse(**row))
+
+            if quota_exhausted:
+                continue
+            if key_index > 0:
+                warnings.append(f"Using Highlightly {_key_label(key_index)}.")
+            warning = " ".join(warnings)
+            if warning:
+                response.headers["X-API-Warning"] = warning
+            MATCH_CACHE[cache_key] = (time.time(), out, warning)
+            return out
+
+        warning = "All configured Highlightly API keys appear exhausted or blocked."
+        response.headers["X-API-Warning"] = warning
+        MATCH_CACHE[cache_key] = (time.time(), [], warning)
+        return []
+
+    response.headers["X-API-Warning"] = (
+        "No Highlightly API key configured; showing demo data."
+    )
+    return DEMO_MATCHES
+
+
 @app.post("/api/workflow/start", response_model=StartWorkflowResponse)
 def start_workflow(request: StartWorkflowRequest) -> StartWorkflowResponse:
     """Launch a new graph thread; runs up to the human-validation interrupt."""
@@ -125,13 +258,14 @@ def start_workflow(request: StartWorkflowRequest) -> StartWorkflowResponse:
     # Reject re-launching an id that already has state.
     existing = ENGINE.get_state(config)
     if existing.created_at is not None:
+        _register_thread(match_id)
         raise HTTPException(
             status_code=409,
             detail=f"A workflow thread for match_id '{match_id}' already exists.",
         )
 
-    ENGINE.invoke({"match_id": match_id}, config=config)
     _register_thread(match_id)
+    ENGINE.invoke({"match_id": match_id}, config=config)
 
     snapshot = ENGINE.get_state(config)
     interrupt_payload = _interrupt_from_snapshot(snapshot)
@@ -171,7 +305,10 @@ def _state_response(match_id: str) -> WorkflowStateResponse | None:
 @app.get("/api/workflow", response_model=list[WorkflowStateResponse])
 def list_workflows() -> list[WorkflowStateResponse]:
     """List every launched thread (newest last) for the dashboard roster."""
-    return [r for mid in THREAD_IDS if (r := _state_response(mid)) is not None]
+    responses = [r for mid in _known_match_ids() if (r := _state_response(mid)) is not None]
+    for response in responses:
+        _register_thread(response.match_id)
+    return responses
 
 
 @app.get("/api/workflow/{match_id}/state", response_model=WorkflowStateResponse)
@@ -184,6 +321,36 @@ def get_workflow_state(match_id: str) -> WorkflowStateResponse:
             status_code=404,
             detail=f"No workflow thread found for match_id '{match_id}'.",
         )
+    return response
+
+
+@app.post("/api/workflow/{match_id}/resume", response_model=WorkflowStateResponse)
+def resume_workflow(match_id: str) -> WorkflowStateResponse:
+    """Continue a thread that exists but is not parked at a human checkpoint."""
+    config = _thread_config(match_id)
+    snapshot = ENGINE.get_state(config)
+    if snapshot.created_at is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No workflow thread found for match_id '{match_id}'.",
+        )
+    if _interrupt_from_snapshot(snapshot) is not None:
+        response = _state_response(match_id)
+        if response is None:
+            raise HTTPException(status_code=404, detail="Thread disappeared.")
+        return response
+
+    try:
+        ENGINE.invoke({}, config=config)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not resume workflow '{match_id}': {exc}",
+        ) from exc
+    _register_thread(match_id)
+    response = _state_response(match_id)
+    if response is None:
+        raise HTTPException(status_code=404, detail="Thread disappeared after resume.")
     return response
 
 

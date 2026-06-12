@@ -1,0 +1,6 @@
+# Local video rendering only — do NOT install on Render.
+# Run: pip install -r requirements-media.txt
+# Then set VIDEO_RENDER_MODE=stub or VIDEO_RENDER_MODE=real in your .env
+moviepy>=2.0
+edge-tts>=6.1
+openai-whisper>=20231117

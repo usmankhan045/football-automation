@@ -10,25 +10,30 @@ import {
   approveWorkflow,
   downloadUrl,
   fetchState,
+  listAvailableMatches,
   listWorkflows,
+  resumeWorkflow,
   startWorkflow,
   uploadAssets,
 } from "@/lib/api";
 import { isActionable, STATUS_META } from "@/lib/status";
-import type { MatchThread, WorkflowStatus } from "@/lib/types";
+import type { AvailableMatch, MatchThread, WorkflowStatus } from "@/lib/types";
 
 interface Notice {
   tone: "ok" | "warn";
   msg: string;
 }
 
-const POLL_MS = 4000;
+const POLL_MS = 8000;
 
 export default function DashboardPage() {
   const [threads, setThreads] = useState<MatchThread[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
-  const [matchInput, setMatchInput] = useState("");
+  const [availableMatches, setAvailableMatches] = useState<AvailableMatch[]>([]);
+  const [selectedMatchId, setSelectedMatchId] = useState<string>("");
+  const [matchDate, setMatchDate] = useState(todayInputValue);
   const [busy, setBusy] = useState(false);
+  const [matchesLoading, setMatchesLoading] = useState(false);
   const [connected, setConnected] = useState<boolean | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [clock, setClock] = useState<string>("--:--:--");
@@ -59,6 +64,29 @@ export default function DashboardPage() {
     }
   }, []);
 
+  const loadMatches = useCallback(async () => {
+    setMatchesLoading(true);
+    try {
+      const result = await listAvailableMatches(matchDate);
+      const list = result.matches;
+      setConnected(true);
+      setAvailableMatches(list);
+      setSelectedMatchId((prev) =>
+        prev && list.some((m) => m.id === prev) ? prev : list[0]?.id ?? "",
+      );
+      if (result.warning) {
+        flash({ tone: "warn", msg: result.warning });
+      }
+    } catch (err) {
+      setConnected(false);
+      setAvailableMatches([]);
+      setSelectedMatchId("");
+      flash({ tone: "warn", msg: `Match list failed — ${errText(err)}` });
+    } finally {
+      setMatchesLoading(false);
+    }
+  }, [flash, matchDate]);
+
   // Initial load + live polling (paused while an action is in-flight).
   useEffect(() => {
     loadThreads();
@@ -67,6 +95,10 @@ export default function DashboardPage() {
     }, POLL_MS);
     return () => window.clearInterval(id);
   }, [loadThreads]);
+
+  useEffect(() => {
+    loadMatches();
+  }, [loadMatches]);
 
   // Live clock — client-only to avoid hydration mismatch.
   useEffect(() => {
@@ -81,6 +113,14 @@ export default function DashboardPage() {
     () => threads.find((t) => t.match_id === selectedId) ?? null,
     [threads, selectedId],
   );
+  const selectedMatch = useMemo(
+    () => availableMatches.find((m) => m.id === selectedMatchId) ?? null,
+    [availableMatches, selectedMatchId],
+  );
+  const demoMode = availableMatches.some((m) => m.data_source === "mock");
+  const shiftDate = useCallback((days: number) => {
+    setMatchDate((prev) => addDays(prev, days));
+  }, []);
 
   const refreshOne = useCallback(async (matchId: string) => {
     try {
@@ -90,6 +130,23 @@ export default function DashboardPage() {
       /* ignore — next poll reconciles */
     }
   }, []);
+
+  const recoverExistingThread = useCallback(
+    async (matchId: string) => {
+      let existing = await fetchState(matchId);
+      if (!existing.interrupted && existing.next_nodes?.length) {
+        existing = await resumeWorkflow(matchId);
+      }
+      setThreads((prev) =>
+        prev.some((t) => t.match_id === existing.match_id)
+          ? prev.map((t) => (t.match_id === existing.match_id ? existing : t))
+          : [...prev, existing],
+      );
+      setSelectedId(existing.match_id);
+      return existing;
+    },
+    [],
+  );
 
   const metrics = useMemo(() => {
     const by = (s: WorkflowStatus) => threads.filter((t) => t.status === s).length;
@@ -104,12 +161,11 @@ export default function DashboardPage() {
   // --- Actions -------------------------------------------------------------
   async function handleStart(e: React.FormEvent) {
     e.preventDefault();
-    const id = matchInput.trim();
+    const id = selectedMatch?.id.trim();
     if (!id || busy) return;
     setBusy(true);
     try {
       const thread = await startWorkflow(id);
-      setMatchInput("");
       await loadThreads();
       setSelectedId(thread.match_id);
       flash({
@@ -119,6 +175,15 @@ export default function DashboardPage() {
         } ${thread.match_stats?.away_team ?? ""}`.trim(),
       });
     } catch (err) {
+      if (err instanceof Error && err.message.startsWith("409")) {
+        try {
+          const existing = await recoverExistingThread(id);
+          flash({ tone: "warn", msg: `Thread already exists · opened ${existing.match_id}` });
+          return;
+        } catch {
+          /* fall through to the normal error */
+        }
+      }
       flash({ tone: "warn", msg: `Start failed — ${errText(err)}` });
     } finally {
       setBusy(false);
@@ -139,18 +204,45 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleUpload(files: File[]) {
+  async function handleResume(matchId = selected?.match_id) {
+    if (!matchId || busy) return;
+    setBusy(true);
+    try {
+      const resumed = await resumeWorkflow(matchId);
+      setThreads((prev) =>
+        prev.some((t) => t.match_id === resumed.match_id)
+          ? prev.map((t) => (t.match_id === resumed.match_id ? resumed : t))
+          : [...prev, resumed],
+      );
+      setSelectedId(resumed.match_id);
+      flash({ tone: "ok", msg: `Continued · ${resumed.match_id} → ${resumed.status}` });
+    } catch (err) {
+      flash({ tone: "warn", msg: `Continue failed — ${errText(err)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUpload(files: File[], onProgress?: (percent: number) => void) {
     if (!selected) return;
     setBusy(true);
     try {
-      const res = await uploadAssets(selected.match_id, files);
+      const res = await uploadAssets(selected.match_id, files, onProgress);
       await refreshOne(selected.match_id);
+      setThreads((prev) =>
+        prev.map((t) =>
+          t.match_id === selected.match_id
+            ? { ...t, status: res.status, uploaded_clips: res.uploaded_clips }
+            : t,
+        ),
+      );
       flash({
         tone: "ok",
         msg: `Uploaded ${res.uploaded_clips}/${res.expected_clips} · ${res.status}`,
       });
     } catch (err) {
       flash({ tone: "warn", msg: `Upload failed — ${errText(err)}` });
+      throw err;
     } finally {
       setBusy(false);
     }
@@ -233,22 +325,105 @@ export default function DashboardPage() {
         <aside className="flex flex-col gap-3">
           {/* Start a workflow */}
           <form onSubmit={handleStart} className="panel corner p-3.5">
-            <label className="label">Start Workflow</label>
-            <div className="mt-2.5 flex gap-2">
-              <input
-                value={matchInput}
-                onChange={(e) => setMatchInput(e.target.value)}
-                placeholder="Highlightly match id"
-                spellCheck={false}
-                className="min-w-0 flex-1 border border-line bg-[#070a0e] px-3 py-2 font-mono text-[12px] text-ink outline-none transition-colors focus:border-[rgba(0,240,200,0.45)]"
-              />
-              <button type="submit" disabled={busy || !matchInput.trim()} className="btn px-3 py-2">
-                {busy ? "…" : "Start →"}
+            <div className="flex items-center justify-between gap-3">
+              <label className="label">Pick Match</label>
+              <button
+                type="button"
+                onClick={loadMatches}
+                disabled={matchesLoading || busy}
+                className="font-mono text-[10px] uppercase tracking-[0.16em] text-dim transition-colors hover:text-accent disabled:opacity-40"
+              >
+                {matchesLoading ? "Loading" : "Refresh"}
               </button>
             </div>
-            <p className="mt-2 font-mono text-[10px] leading-relaxed text-mute">
-              The match id is the LangGraph thread id. Live data via Highlightly.
-            </p>
+
+            <div className="mt-2.5 grid grid-cols-[42px_1fr_42px] gap-2">
+              <button
+                type="button"
+                onClick={() => shiftDate(-1)}
+                className="btn px-2 py-2"
+                aria-label="Previous date"
+              >
+                ←
+              </button>
+              <input
+                type="date"
+                value={matchDate}
+                onChange={(e) => setMatchDate(e.target.value)}
+                className="min-w-0 border border-line bg-[#070a0e] px-3 py-2 font-mono text-[12px] text-ink outline-none transition-colors focus:border-[rgba(0,240,200,0.45)]"
+              />
+              <button
+                type="button"
+                onClick={() => shiftDate(1)}
+                className="btn px-2 py-2"
+                aria-label="Next date"
+              >
+                →
+              </button>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setMatchDate(todayInputValue())}
+              className="mt-2 font-mono text-[10px] uppercase tracking-[0.16em] text-dim transition-colors hover:text-accent"
+            >
+              Today · checking previous day
+            </button>
+
+            {demoMode && (
+              <p className="mt-2 border border-[rgba(255,176,0,0.26)] bg-[rgba(255,176,0,0.06)] px-3 py-2 font-mono text-[10px] leading-relaxed text-[#ffb000]">
+                Demo mode. Set HIGHLIGHTLY_API_KEY and refresh for live matches.
+              </p>
+            )}
+
+            <div className="scroll-thin mt-2.5 flex max-h-[210px] flex-col gap-2 overflow-y-auto pr-1">
+              {availableMatches.length === 0 && (
+                <div className="border border-line px-3 py-4 text-center font-mono text-[11px] text-mute">
+                  {matchesLoading
+                    ? "Scanning finished matches..."
+                    : "No completed World Cup 2026 matches found in this date window."}
+                </div>
+              )}
+
+              {availableMatches.map((match) => {
+                const active = match.id === selectedMatchId;
+                return (
+                  <button
+                    key={match.id}
+                    type="button"
+                    onClick={() => setSelectedMatchId(match.id)}
+                    className="border bg-[#070a0e] p-3 text-left transition-colors hover:border-[rgba(0,240,200,0.45)]"
+                    style={{
+                      borderColor: active ? "rgba(0,240,200,0.58)" : "var(--line)",
+                      boxShadow: active ? "inset 0 0 22px rgba(0,240,200,0.1)" : undefined,
+                    }}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="truncate text-[12px] text-ink">
+                          {match.home_team} v {match.away_team}
+                        </p>
+                        <p className="mt-1 truncate font-mono text-[10px] uppercase tracking-[0.08em] text-mute">
+                          {match.competition ?? match.data_source}
+                          {match.stage ? ` · ${match.stage}` : ""}
+                        </p>
+                      </div>
+                      <span className="shrink-0 font-mono text-[11px] text-dim">
+                        {match.final_score ?? match.status ?? "TBD"}
+                      </span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <button
+              type="submit"
+              disabled={busy || !selectedMatch}
+              className="btn mt-3 w-full px-3 py-2"
+            >
+              {busy ? "Starting..." : "Start Selected"}
+            </button>
           </form>
 
           <div className="flex items-center justify-between pt-1">
@@ -329,11 +504,12 @@ export default function DashboardPage() {
                 selected.video_prompts.length
               }
               uploadedClips={selected.uploaded_clips ?? 0}
+              prompts={selected.video_prompts}
               busy={busy}
               onUpload={handleUpload}
             />
           ) : (
-            <TelemetryView thread={selected} />
+            <TelemetryView thread={selected} busy={busy} onResume={() => handleResume()} />
           )}
         </div>
       </div>
@@ -352,16 +528,29 @@ function EmptyWorkspace({ connected }: { connected: boolean | null }) {
       <p className="max-w-sm font-mono text-[11px] leading-relaxed text-mute">
         {connected === false
           ? "The engine is offline. Launch the backend, then start a workflow."
-          : "Enter a Highlightly match id on the left and hit Start to launch the Outcome-First pipeline."}
+          : "Pick a match on the left and start the Outcome-First pipeline."}
       </p>
     </section>
   );
 }
 
 // --- Detail / completed view -----------------------------------------------
-function TelemetryView({ thread }: { thread: MatchThread }) {
+function TelemetryView({
+  thread,
+  busy,
+  onResume,
+}: {
+  thread: MatchThread;
+  busy?: boolean;
+  onResume: () => void;
+}) {
   const s = thread.match_stats;
   const completed = thread.status === "COMPLETED";
+  const canContinue =
+    !completed &&
+    !thread.interrupted &&
+    Array.isArray(thread.next_nodes) &&
+    thread.next_nodes.length > 0;
   return (
     <section className="panel corner flex h-full flex-col animate-rise">
       <header className="flex items-center justify-between border-b border-line px-5 py-3.5">
@@ -369,6 +558,17 @@ function TelemetryView({ thread }: { thread: MatchThread }) {
           {completed ? "Render Complete" : "Thread Telemetry"}
         </h2>
         <div className="flex items-center gap-3">
+          {canContinue && (
+            <button
+              type="button"
+              onClick={onResume}
+              disabled={busy}
+              className="btn px-4 py-2"
+              style={{ borderColor: "rgba(0,240,200,0.55)", color: "#eafffa" }}
+            >
+              {busy ? "Continuing..." : "Continue Pipeline ->"}
+            </button>
+          )}
           {completed && thread.output_path && (
             <a
               href={downloadUrl(thread.match_id)}
@@ -385,6 +585,15 @@ function TelemetryView({ thread }: { thread: MatchThread }) {
       <div className="flex-1 space-y-6 p-5">
         <StatusStepper status={thread.status} />
         <div className="hairline" />
+
+        {canContinue && (
+          <div className="border border-[rgba(0,240,200,0.28)] bg-[rgba(0,240,200,0.05)] px-4 py-3">
+            <span className="label">Next Step</span>
+            <p className="mt-1.5 font-mono text-[12px] leading-relaxed text-ink">
+              Ready to continue into {thread.next_nodes?.join(", ")}.
+            </p>
+          </div>
+        )}
 
         <div className="grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-3">
           <Field label="Match ID" value={thread.match_id} mono />
@@ -480,4 +689,14 @@ function hostOf(url: string): string {
   } catch {
     return url;
   }
+}
+
+function todayInputValue(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDays(value: string, days: number): string {
+  const date = value ? new Date(`${value}T00:00:00`) : new Date();
+  date.setDate(date.getDate() + days);
+  return date.toISOString().slice(0, 10);
 }
