@@ -64,7 +64,7 @@ export async function listWorkflows(): Promise<MatchThread[]> {
 
 export async function listAvailableMatches(
   date?: string,
-  lookbackDays = 0,
+  lookbackDays = 1,
 ): Promise<{ matches: AvailableMatch[]; warning?: string }> {
   const params = new URLSearchParams();
   if (date) params.set("date", date);

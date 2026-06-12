@@ -170,7 +170,7 @@ def health() -> dict[str, Any]:
 def available_matches(
     response: Response,
     date: date_type | None = None,
-    lookback_days: int = 0,
+    lookback_days: int = 1,
 ) -> list[AvailableMatchResponse]:
     """Return fixture rows for the dashboard picker."""
     keys = _highlightly_keys()
