@@ -12,6 +12,12 @@ import type {
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
 
+// loca.lt tunnels show a bypass page unless this header is present.
+// Safe to include on all requests — ignored by non-tunnel backends.
+const BASE_HEADERS: Record<string, string> = {
+  "bypass-tunnel-reminder": "true",
+};
+
 async function asJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
@@ -29,7 +35,7 @@ async function asJson<T>(res: Response): Promise<T> {
 export async function startWorkflow(matchId?: string): Promise<MatchThread> {
   const res = await fetch(`${API_BASE}/api/workflow/start`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...BASE_HEADERS, "Content-Type": "application/json" },
     body: JSON.stringify({ match_id: matchId ?? null }),
   });
   return asJson<MatchThread>(res);
@@ -38,7 +44,7 @@ export async function startWorkflow(matchId?: string): Promise<MatchThread> {
 export async function fetchState(matchId: string): Promise<MatchThread> {
   const res = await fetch(
     `${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/state`,
-    { cache: "no-store" },
+    { cache: "no-store", headers: BASE_HEADERS },
   );
   return asJson<MatchThread>(res);
 }
@@ -46,12 +52,13 @@ export async function fetchState(matchId: string): Promise<MatchThread> {
 export async function resumeWorkflow(matchId: string): Promise<MatchThread> {
   const res = await fetch(`${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/resume`, {
     method: "POST",
+    headers: BASE_HEADERS,
   });
   return asJson<MatchThread>(res);
 }
 
 export async function listWorkflows(): Promise<MatchThread[]> {
-  const res = await fetch(`${API_BASE}/api/workflow`, { cache: "no-store" });
+  const res = await fetch(`${API_BASE}/api/workflow`, { cache: "no-store", headers: BASE_HEADERS });
   return asJson<MatchThread[]>(res);
 }
 
@@ -63,7 +70,7 @@ export async function listAvailableMatches(
   if (date) params.set("date", date);
   params.set("lookback_days", String(lookbackDays));
   const query = params.toString() ? `?${params.toString()}` : "";
-  const res = await fetch(`${API_BASE}/api/matches${query}`, { cache: "no-store" });
+  const res = await fetch(`${API_BASE}/api/matches${query}`, { cache: "no-store", headers: BASE_HEADERS });
   const matches = await asJson<AvailableMatch[]>(res);
   return { matches, warning: res.headers.get("X-API-Warning") ?? undefined };
 }
@@ -80,7 +87,7 @@ export async function approveWorkflow(
     `${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/approve`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...BASE_HEADERS, "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     },
   );
@@ -101,6 +108,7 @@ export async function uploadAssets(
       "POST",
       `${API_BASE}/api/workflow/${encodeURIComponent(matchId)}/upload-assets`,
     );
+    xhr.setRequestHeader("bypass-tunnel-reminder", "true");
     xhr.upload.onprogress = (event) => {
       if (!event.lengthComputable) return;
       onProgress?.(Math.round((event.loaded / event.total) * 100));
