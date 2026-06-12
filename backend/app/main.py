@@ -7,6 +7,7 @@ interrupt) and one to poll a thread's persisted state.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -15,7 +16,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from langgraph.checkpoint.memory import MemorySaver
@@ -395,9 +396,19 @@ def approve_workflow(match_id: str, request: ApproveRequest) -> ApproveResponse:
     )
 
 
+def _resume_in_background(config: dict[str, Any]) -> None:
+    """Fire the asset-ready resume in a background thread (avoids gateway timeouts)."""
+    try:
+        _resume(config, {"assets_ready": True})
+    except Exception as exc:
+        logging.getLogger("main").warning("Background render failed: %s", exc)
+
+
 @app.post("/api/workflow/{match_id}/upload-assets", response_model=UploadAssetsResponse)
 async def upload_assets(
-    match_id: str, files: list[UploadFile] = File(...)
+    match_id: str,
+    background_tasks: BackgroundTasks,
+    files: list[UploadFile] = File(...),
 ) -> UploadAssetsResponse:
     """Stage Veo ``.mp4`` clips and advance to RENDERING once all are present.
 
@@ -453,8 +464,8 @@ async def upload_assets(
     status = values.get("status", "")
     if complete:
         ENGINE.update_state(config, {"status": WorkflowStatus.RENDERING.value})
-        resumed = _resume(config, {"assets_ready": True})
-        status = resumed.get("status", WorkflowStatus.RENDERING.value)
+        status = WorkflowStatus.RENDERING.value
+        background_tasks.add_task(_resume_in_background, config)
 
     return UploadAssetsResponse(
         match_id=match_id,
